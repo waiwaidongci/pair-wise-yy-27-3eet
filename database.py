@@ -10,6 +10,10 @@ from pathlib import Path
 class DomainError(ValueError):
     """Business rule violation."""
 
+    def __init__(self, message: str = "", details: dict | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
+
 
 WITNESS_KINDS = {"version", "fragment", "transcription"}
 SPECIAL_TOKENS = {"[缺页]", "[不可辨]", "[残损]", "[插入]", "[删除]"}
@@ -144,6 +148,17 @@ class CollationDB:
               reason TEXT NOT NULL DEFAULT '',
               locked_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS witness_stemma (
+              witness_id INTEGER PRIMARY KEY REFERENCES witnesses(id) ON DELETE CASCADE,
+              parent_id INTEGER REFERENCES witnesses(id) ON DELETE CASCADE,
+              basis TEXT NOT NULL DEFAULT '',
+              is_root INTEGER NOT NULL DEFAULT 0,
+              updated_by INTEGER NOT NULL REFERENCES users(id),
+              updated_at TEXT NOT NULL,
+              CHECK(parent_id IS NOT NULL OR is_root=1),
+              CHECK(parent_id IS NULL OR is_root=0),
+              CHECK(witness_id IS NOT parent_id)
+            );
             """
         )
         self.conn.commit()
@@ -156,7 +171,11 @@ class CollationDB:
         work = self.create_work("一则残卷", "演示不同版本的校勘", owner)
         w1 = self.add_witness(work, "甲本", "version", "馆藏胶片", "")
         w2 = self.add_witness(work, "乙本", "fragment", "残片转录", "第二句残损")
+        w3 = self.add_witness(work, "丙抄", "transcription", "近人抄本", "")
+        self.set_lineage(w1, None, "馆藏胶片可定为祖本", owner)
+        self.set_lineage(w2, w1, "行款与避讳字同甲本，定为据甲本传抄", owner)
         self.grant_witness_editor(w2, editor, owner)
+        self.grant_witness_editor(w3, editor, owner)
         passage = self.add_passage(work, "第1节", "春水东流，故人南去。", owner)
         self.align_passage(passage, w1, "春水东流，故人南去。", 1, owner)
         self.align_passage(passage, w2, "春水东流，[不可辨][不可辨]。", 2, owner)
@@ -249,6 +268,121 @@ class CollationDB:
                 "INSERT OR IGNORE INTO witness_editors(witness_id,user_id,granted_by) VALUES(?,?,?)",
                 (witness_id, user_id, granted_by),
             )
+
+    # ---- 版本谱系 -------------------------------------------------------
+
+    def _lineage_map(self, work_id: int) -> dict[int, sqlite3.Row]:
+        rows = self.conn.execute(
+            "SELECT s.* FROM witness_stemma s JOIN witnesses w ON w.id=s.witness_id WHERE w.work_id=?",
+            (work_id,),
+        ).fetchall()
+        return {int(r["witness_id"]): r for r in rows}
+
+    def _ancestor_chain(self, witness_id: int, edges: dict[int, sqlite3.Row]) -> list[int]:
+        """沿父本链上溯，遇到未登记版本或祖本即止。写入前已保证无环。"""
+        chain: list[int] = []
+        cur = witness_id
+        seen: set[int] = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            chain.append(cur)
+            row = edges.get(cur)
+            cur = int(row["parent_id"]) if row is not None and row["parent_id"] is not None else None
+        return chain
+
+    def set_lineage(self, witness_id: int, parent_id: int | None, basis: str, user_id: int) -> None:
+        """为版本登记（或改选）父本；parent_id 为空表示登记为祖本。"""
+        witness = self.conn.execute("SELECT * FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+        if not witness:
+            raise DomainError("版本不存在")
+        if not self.can_edit_witness(witness_id, user_id):
+            raise DomainError("无权修改该版本谱系")
+        parent_id = parent_id or None
+        if parent_id is not None and not len(basis.strip()):
+            raise DomainError("登记父本必须填写依据")
+        parent = None
+        if parent_id is not None:
+            parent = self.conn.execute("SELECT * FROM witnesses WHERE id=?", (parent_id,)).fetchone()
+            if not parent or parent["work_id"] != witness["work_id"]:
+                raise DomainError("父本必须是同一作品中的版本")
+        edges = self._lineage_map(witness["work_id"])
+        if parent_id is not None:
+            # 暂按新关系看待子本：从父本上溯，若回到子本即成环
+            edges = dict(edges)
+            edges[witness_id] = {"parent_id": parent_id}
+            chain = self._ancestor_chain(parent_id, edges)
+            if witness_id in chain:
+                # 环路：本版本 → 拟选父本 → … → 回到本版本
+                loop = [witness_id] + chain
+                sigla = {r["id"]: r["siglum"] for r in self.conn.execute(
+                    "SELECT id,siglum FROM witnesses WHERE work_id=?", (witness["work_id"],))}
+                raise DomainError(
+                    "祖先链绕回本版本，已拒绝该父本关系",
+                    {"conflict_witness_ids": loop[:-1],
+                     "conflict_chain": [f"{sigla.get(i, i)}" for i in loop]},
+                )
+        with self.transaction():
+            self.conn.execute(
+                "INSERT INTO witness_stemma(witness_id,parent_id,basis,is_root,updated_by,updated_at) "
+                "VALUES(?,?,?,?,?,?) "
+                "ON CONFLICT(witness_id) DO UPDATE SET parent_id=excluded.parent_id,"
+                "basis=excluded.basis,is_root=excluded.is_root,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                (witness_id, parent_id, basis.strip(), 1 if parent_id is None else 0,
+                 user_id, datetime.now().isoformat()),
+            )
+
+    def withdraw_lineage(self, witness_id: int, user_id: int) -> None:
+        """撤回已登记的父本/祖本关系，版本重新变为来源未登记。"""
+        witness = self.conn.execute("SELECT work_id FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+        if not witness:
+            raise DomainError("版本不存在")
+        if not self.can_edit_witness(witness_id, user_id):
+            raise DomainError("无权修改该版本谱系")
+        with self.transaction():
+            self.conn.execute("DELETE FROM witness_stemma WHERE witness_id=?", (witness_id,))
+
+    def lineage_report(self, work_id: int, user_id: int) -> dict:
+        if not self.can_view_work(work_id, user_id):
+            raise DomainError("无权查看该作品谱系")
+        witnesses = [dict(r) for r in self.conn.execute(
+            "SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))]
+        edges = self._lineage_map(work_id)
+        sigla = {w["id"]: w["siglum"] for w in witnesses}
+
+        def chain_payload(wid: int) -> list[dict]:
+            return [{"witness_id": i, "siglum": sigla[i]} for i in self._ancestor_chain(wid, edges)]
+
+        items, unregistered = [], []
+        for w in witnesses:
+            row = edges.get(w["id"])
+            if row is None:
+                unregistered.append({"witness_id": w["id"], "siglum": w["siglum"]})
+                items.append({**w, "parent_id": None, "basis": "", "is_root": False,
+                              "registered": False, "generation": 0,
+                              "ancestor_chain": [{"witness_id": w["id"], "siglum": w["siglum"]}]})
+                continue
+            chain_ids = self._ancestor_chain(w["id"], edges)
+            items.append({**w, "parent_id": row["parent_id"], "basis": row["basis"],
+                          "is_root": bool(row["is_root"]), "registered": True,
+                          "generation": len(chain_ids) - 1,
+                          "ancestor_chain": [{"witness_id": i, "siglum": sigla[i]} for i in chain_ids]})
+        return {"witnesses": items, "unregistered": unregistered}
+
+    @staticmethod
+    def _common_ancestor(chain_lists: list[list[int]]) -> int | None:
+        """多个版本祖先链的最深共同节点；链顶不同则无共同祖本。"""
+        if not chain_lists:
+            return None
+        shared = set(chain_lists[0])
+        for chain in chain_lists[1:]:
+            shared &= set(chain)
+        if not shared:
+            return None
+        # 在第一条链上自近及远，最先命中的共同节点即最深共同祖本
+        for wid in chain_lists[0]:
+            if wid in shared:
+                return wid
+        return None
 
     def add_passage(self, work_id: int, label: str, base_text: str, user_id: int) -> int:
         self._require_owner(work_id, user_id)
@@ -393,10 +527,13 @@ class CollationDB:
             raise DomainError("无权查看该校勘项目")
         work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
         witnesses = [dict(r) for r in self.conn.execute("SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))]
+        edges = self._lineage_map(work_id)
+        sigla = {w["id"]: w["siglum"] for w in witnesses}
         passages = []
         gaps = 0
         for passage in self.conn.execute("SELECT * FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
             alignments = []
+            aligned_chains: list[list[int]] = []
             for row in self.conn.execute(
                 "SELECT a.*,w.siglum,w.kind,w.missing_sections FROM alignments a JOIN witnesses w ON w.id=a.witness_id "
                 "WHERE a.passage_id=? ORDER BY a.sort_order", (passage["id"],)
@@ -405,13 +542,32 @@ class CollationDB:
                 if "[缺页]" in item["aligned_text"] or "[残损]" in item["aligned_text"]:
                     item["has_gap"] = True
                     gaps += 1
+                chain_ids = self._ancestor_chain(item["witness_id"], edges)
+                aligned_chains.append(chain_ids)
+                row_edge = edges.get(item["witness_id"])
+                item["is_root"] = bool(row_edge and row_edge["is_root"])
+                item["registered"] = row_edge is not None
+                item["basis"] = row_edge["basis"] if row_edge is not None else ""
+                item["ancestor_chain"] = [{"witness_id": i, "siglum": sigla.get(i, str(i))} for i in chain_ids]
+                item["generation"] = len(chain_ids) - 1
                 alignments.append(item)
+            common_id = self._common_ancestor(aligned_chains)
+            genealogy = {
+                "common_ancestor": None if common_id is None
+                else {"witness_id": common_id, "siglum": sigla.get(common_id, str(common_id))},
+                "witnesses": [
+                    {"witness_id": a["witness_id"], "siglum": a["siglum"],
+                     "generation": a["generation"], "ancestor_chain": a["ancestor_chain"]}
+                    for a in alignments
+                ],
+            }
             variants = []
             for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
                 variants.append(variant)
-            passages.append({**dict(passage), "alignments": alignments, "variants": variants})
+            passages.append({**dict(passage), "alignments": alignments, "variants": variants,
+                             "genealogy": genealogy})
         return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
 
     def snapshot(self) -> dict:
@@ -419,5 +575,6 @@ class CollationDB:
             "users": [dict(r) for r in self.conn.execute("SELECT id,name,role FROM users ORDER BY id")],
             "works": [dict(r) for r in self.conn.execute("SELECT * FROM works ORDER BY id")],
             "witnesses": [dict(r) for r in self.conn.execute("SELECT * FROM witnesses ORDER BY id")],
+            "stemma": [dict(r) for r in self.conn.execute("SELECT * FROM witness_stemma ORDER BY witness_id")],
             "passages": [dict(r) for r in self.conn.execute("SELECT * FROM passages ORDER BY id")],
         }
