@@ -17,6 +17,9 @@ python -m unittest discover -s tests -v
 - 段落和版本必须属于同一作品，同一版本不能重复对齐同一段落。
 - 只有负责人或被单独授权的编辑可以修改对应版本；其他用户只有查看权限。
 - `[缺页]`、`[不可辨]`、`[残损]` 等标记会参与校勘稿导出和缺口统计，不匹配的方括号会拒绝保存。
+- 版本谱系在同一作品内登记承传关系：子本至多保留一个父本，祖本没有父本；父本必须出自同一作品且必须填写承传依据。
+- 登记或改选父本时若祖先链绕回子本自己（成环）会被拒绝，错误响应以 `conflict_witness` 返回冲突版本；撤回或改选父本后，后代的祖先链、世代和共同祖本即时重算。
+- 校勘稿按段落列出每个对齐版本的祖先链（祖本→子本）与世代，并给出该段所有对齐版本的最深共同祖本；分属不同谱系时共同祖本为空。
 - 每次新增或修改异文都会产生递增修订号和 JSON 快照；提交必须携带 `expected_revision`，旧页面不能覆盖新层。
 - 锁定段落由负责人执行，锁定后任何新修订都会被拒绝。
 
@@ -24,6 +27,7 @@ python -m unittest discover -s tests -v
 
 - `POST /api/users`、`POST /api/works`
 - `POST /api/works/{id}/witnesses`、`POST /api/witnesses/{id}/editors`
+- `POST /api/witnesses/{id}/parent`、`POST /api/witnesses/{id}/parent/clear`（登记/改选、撤回父本）
 - `POST /api/works/{id}/passages`、`POST /api/works/{id}/access`
 - `POST /api/alignments`
 - `POST /api/variants`、`POST /api/variants/{id}/revisions`

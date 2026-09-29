@@ -10,6 +10,10 @@ from pathlib import Path
 class DomainError(ValueError):
     """Business rule violation."""
 
+    def __init__(self, message: str, extra: dict | None = None) -> None:
+        super().__init__(message)
+        self.extra = extra or {}
+
 
 WITNESS_KINDS = {"version", "fragment", "transcription"}
 SPECIAL_TOKENS = {"[缺页]", "[不可辨]", "[残损]", "[插入]", "[删除]"}
@@ -86,6 +90,13 @@ class CollationDB:
               granted_by INTEGER NOT NULL REFERENCES users(id),
               PRIMARY KEY(witness_id,user_id)
             );
+            CREATE TABLE IF NOT EXISTS witness_parents (
+              witness_id INTEGER PRIMARY KEY REFERENCES witnesses(id) ON DELETE CASCADE,
+              parent_id INTEGER NOT NULL REFERENCES witnesses(id) ON DELETE CASCADE,
+              basis TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              CHECK(witness_id<>parent_id)
+            );
             CREATE TABLE IF NOT EXISTS passages (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
               work_id INTEGER NOT NULL REFERENCES works(id) ON DELETE CASCADE,
@@ -154,9 +165,11 @@ class CollationDB:
         owner = self.add_user("项目负责人", "owner")
         editor = self.add_user("校勘编辑", "editor")
         work = self.create_work("一则残卷", "演示不同版本的校勘", owner)
-        w1 = self.add_witness(work, "甲本", "version", "馆藏胶片", "")
+        w1 = self.add_witness(work, "甲本", "version", "馆藏胶片，似为祖本", "")
         w2 = self.add_witness(work, "乙本", "fragment", "残片转录", "第二句残损")
+        w3 = self.add_witness(work, "丙本", "transcription", "后人录副本，来源待考", "")
         self.grant_witness_editor(w2, editor, owner)
+        self.set_witness_parent(w2, w1, "行款避讳与甲本一致，定为据甲本所抄", owner)
         passage = self.add_passage(work, "第1节", "春水东流，故人南去。", owner)
         self.align_passage(passage, w1, "春水东流，故人南去。", 1, owner)
         self.align_passage(passage, w2, "春水东流，[不可辨][不可辨]。", 2, owner)
@@ -249,6 +262,125 @@ class CollationDB:
                 "INSERT OR IGNORE INTO witness_editors(witness_id,user_id,granted_by) VALUES(?,?,?)",
                 (witness_id, user_id, granted_by),
             )
+
+    def set_witness_parent(self, witness_id: int, parent_id: int, basis: str, user_id: int) -> dict:
+        """登记或改选子本的父本（至多一个）；祖先链绕回自己时拒绝。"""
+        witness = self.conn.execute("SELECT work_id,siglum FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+        parent = self.conn.execute("SELECT work_id,siglum FROM witnesses WHERE id=?", (parent_id,)).fetchone()
+        if not witness or not parent:
+            raise DomainError("版本不存在")
+        if witness["work_id"] != parent["work_id"]:
+            raise DomainError("父本必须出自同一作品")
+        if witness_id == parent_id:
+            raise DomainError("版本不能以自己为父本，谱系不允许环路",
+                              {"conflict_witness": {"id": witness_id, "siglum": witness["siglum"]}})
+        if not self.can_edit_witness(witness_id, user_id):
+            raise DomainError("无权编辑该版本")
+        if not basis.strip():
+            raise DomainError("必须登记承传依据")
+        parent_of = dict(self.conn.execute(
+            "SELECT witness_id,parent_id FROM witness_parents WHERE witness_id IN "
+            "(SELECT id FROM witnesses WHERE work_id=?) OR parent_id IN (SELECT id FROM witnesses WHERE work_id=?)",
+            (witness["work_id"], witness["work_id"]),
+        ).fetchall())
+        # 沿新父本的祖先链上溯，若遇到子本自身则会绕回成环
+        node, seen = parent_id, set()
+        while node is not None and node not in seen:
+            if node == witness_id:
+                raise DomainError(f"不能改选父本：{parent['siglum']}的祖先中已有{witness['siglum']}，谱系不允许环路",
+                                  {"conflict_witness": {"id": witness_id, "siglum": witness["siglum"]}})
+            seen.add(node)
+            node = parent_of.get(node)
+        with self.transaction():
+            self.conn.execute(
+                "INSERT INTO witness_parents(witness_id,parent_id,basis,created_at) VALUES(?,?,?,?) "
+                "ON CONFLICT(witness_id) DO UPDATE SET parent_id=excluded.parent_id,basis=excluded.basis,created_at=excluded.created_at",
+                (witness_id, parent_id, basis.strip(), datetime.now().isoformat()),
+            )
+        return self._lineage_descriptor(witness_id)
+
+    def clear_witness_parent(self, witness_id: int, user_id: int) -> dict:
+        """撤回承传关系；之后该版本成为无父本的祖本，谱系重算。"""
+        witness = self.conn.execute("SELECT work_id FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+        if not witness:
+            raise DomainError("版本不存在")
+        if not self.can_edit_witness(witness_id, user_id):
+            raise DomainError("无权编辑该版本")
+        with self.transaction():
+            self.conn.execute("DELETE FROM witness_parents WHERE witness_id=?", (witness_id,))
+        return self._lineage_descriptor(witness_id)
+
+    def _work_stemma(self, work_id: int) -> tuple[dict, dict, dict]:
+        """返回作品内谱系：parent_of、登记依据、版本标识。"""
+        rows = self.conn.execute(
+            "SELECT p.witness_id,p.parent_id,p.basis,w.siglum FROM witness_parents p "
+            "JOIN witnesses w ON w.id=p.witness_id WHERE w.work_id=?",
+            (work_id,),
+        ).fetchall()
+        parent_of, basis_of, sigla = {}, {}, {}
+        for row in rows:
+            parent_of[row["witness_id"]] = row["parent_id"]
+            basis_of[row["witness_id"]] = row["basis"]
+        for row in self.conn.execute("SELECT id,siglum FROM witnesses WHERE work_id=?", (work_id,)).fetchall():
+            sigla[row["id"]] = row["siglum"]
+        return parent_of, basis_of, sigla
+
+    def _chain(self, witness_id: int, parent_of: dict | None = None) -> list:
+        """从子本自身上溯到最远祖本，返回[自身,父本,……,祖本]。"""
+        if parent_of is None:
+            work = self.conn.execute("SELECT work_id FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+            if not work:
+                raise DomainError("版本不存在")
+            parent_of, _, _ = self._work_stemma(work["work_id"])
+        chain, node, seen = [], witness_id, set()
+        while node is not None and node not in seen:
+            seen.add(node)
+            chain.append(node)
+            node = parent_of.get(node)
+        return chain
+
+    def _lineage_descriptor(self, witness_id: int) -> dict:
+        work = self.conn.execute("SELECT work_id FROM witnesses WHERE id=?", (witness_id,)).fetchone()
+        if not work:
+            raise DomainError("版本不存在")
+        parent_of, basis_of, sigla = self._work_stemma(work["work_id"])
+        chain = self._chain(witness_id, parent_of)
+        parent_id = parent_of.get(witness_id)
+        return {
+            "witness_id": witness_id,
+            "parent_id": parent_id,
+            "parent_siglum": sigla.get(parent_id) if parent_id else None,
+            "basis": basis_of.get(witness_id, ""),
+            "is_archetype": parent_id is None,
+            "generation": len(chain) - 1,
+            "ancestor_chain": [sigla.get(wid, f"#{wid}") for wid in reversed(chain)],
+            "ancestor_chain_ids": list(reversed(chain)),
+        }
+
+    @staticmethod
+    def _lowest_common_ancestor(ids: list, parent_of: dict) -> int | None:
+        """多个版本的最深共同祖本；分属不同谱系（含不同祖本）时为空。"""
+        if not ids:
+            return None
+        common = set()
+        node, seen = ids[0], set()
+        while node is not None and node not in seen:
+            seen.add(node)
+            common.add(node)
+            node = parent_of.get(node)
+        for wid in ids[1:]:
+            ancestors, node, seen = set(), wid, set()
+            while node is not None and node not in seen:
+                seen.add(node)
+                ancestors.add(node)
+                node = parent_of.get(node)
+            common &= ancestors
+            if not common:
+                return None
+        node = ids[0]
+        while node not in common:
+            node = parent_of[node]
+        return node
 
     def add_passage(self, work_id: int, label: str, base_text: str, user_id: int) -> int:
         self._require_owner(work_id, user_id)
@@ -392,11 +524,19 @@ class CollationDB:
         if not self.can_view_work(work_id, user_id):
             raise DomainError("无权查看该校勘项目")
         work = self.conn.execute("SELECT * FROM works WHERE id=?", (work_id,)).fetchone()
-        witnesses = [dict(r) for r in self.conn.execute("SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,))]
+        parent_of, basis_of, sigla = self._work_stemma(work_id)
+        witnesses = []
+        for row in self.conn.execute("SELECT * FROM witnesses WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
+            item = dict(row)
+            parent_id = parent_of.get(row["id"])
+            item["parent_id"] = parent_id
+            item["parent_basis"] = basis_of.get(row["id"], "")
+            witnesses.append(item)
         passages = []
         gaps = 0
         for passage in self.conn.execute("SELECT * FROM passages WHERE work_id=? ORDER BY id", (work_id,)).fetchall():
             alignments = []
+            aligned_ids = []
             for row in self.conn.execute(
                 "SELECT a.*,w.siglum,w.kind,w.missing_sections FROM alignments a JOIN witnesses w ON w.id=a.witness_id "
                 "WHERE a.passage_id=? ORDER BY a.sort_order", (passage["id"],)
@@ -405,19 +545,34 @@ class CollationDB:
                 if "[缺页]" in item["aligned_text"] or "[残损]" in item["aligned_text"]:
                     item["has_gap"] = True
                     gaps += 1
+                chain_ids = list(reversed(self._chain(row["witness_id"], parent_of)))
+                item["ancestor_chain_ids"] = chain_ids
+                item["ancestor_chain"] = [sigla.get(cid, f"#{cid}") for cid in chain_ids]
+                item["generation"] = len(chain_ids) - 1
                 alignments.append(item)
+                aligned_ids.append(row["witness_id"])
+            lca_id = self._lowest_common_ancestor(aligned_ids, parent_of)
             variants = []
             for row in self.conn.execute("SELECT * FROM variants WHERE passage_id=? ORDER BY witness_id,layer,id", (passage["id"],)).fetchall():
                 variant = dict(row)
                 variant["notes"] = [dict(r) for r in self.conn.execute("SELECT * FROM notes WHERE variant_id=? ORDER BY id", (row["id"],))]
                 variants.append(variant)
-            passages.append({**dict(passage), "alignments": alignments, "variants": variants})
+            passages.append({
+                **dict(passage),
+                "alignments": alignments,
+                "variants": variants,
+                "common_ancestor_id": lca_id,
+                "common_ancestor_siglum": sigla.get(lca_id) if lca_id else None,
+            })
         return {"work": dict(work), "witnesses": witnesses, "passages": passages, "gap_count": gaps}
 
     def snapshot(self) -> dict:
         return {
             "users": [dict(r) for r in self.conn.execute("SELECT id,name,role FROM users ORDER BY id")],
             "works": [dict(r) for r in self.conn.execute("SELECT * FROM works ORDER BY id")],
-            "witnesses": [dict(r) for r in self.conn.execute("SELECT * FROM witnesses ORDER BY id")],
+            "witnesses": [dict(r) for r in self.conn.execute(
+                "SELECT w.*,p.parent_id,p.basis AS parent_basis FROM witnesses w "
+                "LEFT JOIN witness_parents p ON p.witness_id=w.id ORDER BY w.id")],
+            "witness_parents": [dict(r) for r in self.conn.execute("SELECT * FROM witness_parents ORDER BY witness_id")],
             "passages": [dict(r) for r in self.conn.execute("SELECT * FROM passages ORDER BY id")],
         }
